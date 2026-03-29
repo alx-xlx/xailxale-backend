@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+tailscale_monitor.db
+.venv/
+data/
+tailscale-state/

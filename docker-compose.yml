@@ -1,0 +1,69 @@
+services:
+  tailscale-monitor:
+    build:
+      context: .
+    image: tailscale-monitor:latest
+    container_name: tailscale-monitor
+    restart: unless-stopped
+    ports:
+      - "5189:5189"
+    environment:
+      # Connection mode:
+      # - self: start tailscaled inside the container
+      # - host: reuse the host machine's tailscaled socket
+      TS_CONNECTION_MODE: ${TS_CONNECTION_MODE:-self}
+
+      # Self mode only:
+      # Provide TS_AUTHKEY so the container can join your tailnet automatically.
+      # This is NOT needed in host mode because the host daemon is already logged in.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-tailscale-monitor}
+      TS_ACCEPT_DNS: ${TS_ACCEPT_DNS:-false}
+      TS_ACCEPT_ROUTES: ${TS_ACCEPT_ROUTES:-false}
+      TS_ADVERTISE_TAGS: ${TS_ADVERTISE_TAGS:-}
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:-}
+      TS_POLL_INTERVAL_SECONDS: ${TS_POLL_INTERVAL_SECONDS:-60}
+      TS_TAILSCALE_TIMEOUT_SECONDS: ${TS_TAILSCALE_TIMEOUT_SECONDS:-15}
+
+      # Self mode tuning. Set TS_USERSPACE=true if /dev/net/tun is unavailable.
+      TS_USERSPACE: ${TS_USERSPACE:-false}
+
+      # App/database settings.
+      TS_MONITOR_DB_PATH: /data/tailscale_monitor.db
+      APP_PORT: 5189
+
+      # Internal tailscaled socket for self mode.
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+
+      # Host daemon socket path inside the container for host mode.
+      TS_HOST_SOCKET: /host-tailscale/tailscaled.sock
+
+      # Leave unset unless you need to override socket selection manually.
+      # In normal use, the entrypoint picks the right socket from TS_CONNECTION_MODE.
+      TAILSCALE_SOCKET: ${TAILSCALE_SOCKET:-}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      # SQLite database storage.
+      - tailscale-monitor-data:/data
+
+      # Self mode Tailscale state storage.
+      - tailscale-state:/var/lib/tailscale
+
+      # Host mode access to the host's tailscaled socket.
+      # Safe to keep mounted even in self mode; it is only used when TS_CONNECTION_MODE=host.
+      - /var/run/tailscale:/host-tailscale:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; urllib.request.urlopen('http://127.0.0.1:5189/health', timeout=3); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  tailscale-monitor-data:
+  tailscale-state:

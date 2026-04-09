@@ -1,10 +1,9 @@
 services:
   tailscale-monitor:
+    container_name: tailscale-monitor
     build:
       context: .
     image: tailscale-monitor:latest
-    container_name: tailscale-monitor
-    restart: unless-stopped
     ports:
       - "${APP_PORT:-5189}:5189"
     environment:
@@ -37,6 +36,7 @@ services:
       - tailscale-monitor-data:/data
       - tailscale-state:/var/lib/tailscale
       - /var/run/tailscale:/host-tailscale:ro
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import sys, urllib.request; urllib.request.urlopen('http://127.0.0.1:5189/health', timeout=3); sys.exit(0)"]
       interval: 30s

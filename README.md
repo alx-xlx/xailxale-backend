@@ -2,6 +2,8 @@
 
 This backend stores periodic `tailscale status --json` snapshots in SQLite so the app can render both the latest status and historical charts.
 
+The iOS client for this backend lives in a separate repository: [xailxale-ios](https://github.com/alx-xlx/xailxale-ios).
+
 The storage model is split into:
 
 - raw snapshots for debugging and detailed inspection

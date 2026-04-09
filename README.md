@@ -2,16 +2,23 @@
 
 This backend stores periodic `tailscale status --json` snapshots in SQLite so the app can render both the latest status and historical charts.
 
+The storage model is split into:
+
+- raw snapshots for debugging and detailed inspection
+- metric samples for fast latest-status and raw history queries
+- precomputed rollups for common chart resolutions
+
 ## Features
 
 - Background collector that polls Tailscale on a schedule
-- SQLite persistence for raw snapshots and chart-friendly metrics
+- SQLite persistence for raw snapshots, query-friendly metrics, and rollups
 - Tailscale daemon bundled into the container
 - Multi-arch Docker image support for `amd64` and `arm64`
 - Healthchecked API container with persistent Tailscale and database state
-- `GET /status` for the latest stored snapshot
-- `GET /history` for time-ranged chart data
+- `GET /status` for a lightweight latest sample, with optional full raw payload
+- `GET /history` for time-ranged chart data backed by metric samples and rollups
 - `GET /instances` for known nodes
+- `GET /snapshots/<id>` for a full stored raw snapshot
 - `POST /collect` to force an immediate snapshot
 
 ## Local Python Setup
@@ -39,24 +46,32 @@ The container:
 
 ### Docker Compose
 
+The easiest setup flow is:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and choose either self mode or host mode. In normal use, you should not need to edit `docker-compose.yml`; Compose reads `.env` automatically and passes those values into the container.
+
 #### Self Mode
 
 Use this when you want the container to manage its own Tailscale connection.
 
-1. Set the mode and auth key in your shell:
+Recommended `.env` values:
 
 ```bash
-export TS_CONNECTION_MODE=self
-export TS_AUTHKEY=tskey-auth-xxxxxxxxxxxxxxxx
+TS_CONNECTION_MODE=self
+TS_AUTHKEY=tskey-auth-xxxxxxxxxxxxxxxx
 ```
 
-2. Start the stack:
+Then start the stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-3. Open the API:
+Open the API:
 
 ```bash
 curl http://localhost:5189/health
@@ -73,14 +88,14 @@ In self mode:
 
 Use this when the host machine is already logged into Tailscale and you want the container to read from the host daemon instead of starting its own.
 
-1. Set the mode:
+Recommended `.env` values:
 
 ```bash
-export TS_CONNECTION_MODE=host
-unset TS_AUTHKEY
+TS_CONNECTION_MODE=host
+TS_AUTHKEY=
 ```
 
-2. Start the stack:
+Then start the stack:
 
 ```bash
 docker compose up -d --build
@@ -151,11 +166,13 @@ docker buildx build \
 
 ### `GET /status`
 
-Returns the latest stored snapshot. If the database is empty, the server collects one immediately.
+Returns the latest stored metric sample. If the database is empty, the server collects one immediately.
 
 Optional query params:
 
 - `instance_id`
+- `include_status=true` to include the full raw `tailscale status --json` payload
+- `fresh=true` to force a live collection before responding
 
 ### `GET /history`
 
@@ -167,10 +184,25 @@ Query params:
 - `instance_id`
 - `limit`: default `500`, max `5000`
 
+Responses include `query.source` so the client can tell whether the data came from:
+
+- `raw_samples`
+- `precomputed_rollup`
+- `ad_hoc_rollup`
+
 ### `GET /instances`
 
 Returns distinct instances seen in stored snapshots.
 
+### `GET /snapshots/<id>`
+
+Returns the full raw snapshot payload for a stored snapshot id.
+
 ### `POST /collect`
 
-Triggers an immediate collection and stores the result.
+Triggers an immediate collection, stores the raw snapshot plus derived metrics, and returns the new sample with the raw payload.
+
+## Additional Docs
+
+- [API Reference](./API.md)
+- [OpenAPI Specification](./openapi.yaml)

@@ -1,0 +1,391 @@
+openapi: 3.1.0
+info:
+  title: Tailscale Monitoring Backend API
+  version: 1.0.0
+  description: |
+    Machine-readable OpenAPI specification for the Tailscale Monitoring backend.
+
+    The backend stores raw Tailscale snapshots, flattened metric samples,
+    and precomputed rollups for chart queries.
+servers:
+  - url: http://localhost:5189
+    description: Local default server
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Returns service health, storage counts, and backend runtime metadata.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Health metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /status:
+    get:
+      summary: Get latest status
+      description: |
+        Returns the latest metric sample. If no stored sample exists yet, the backend
+        performs a collection automatically. Set `fresh=true` to force a live collection.
+      operationId: getStatus
+      parameters:
+        - $ref: '#/components/parameters/InstanceId'
+        - name: include_status
+          in: query
+          description: Include the full raw `tailscale status --json` payload in the response.
+          required: false
+          schema:
+            $ref: '#/components/schemas/BooleanLike'
+        - name: fresh
+          in: query
+          description: Force a live collection before responding.
+          required: false
+          schema:
+            $ref: '#/components/schemas/BooleanLike'
+      responses:
+        '200':
+          description: Latest metric sample
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricSample'
+  /history:
+    get:
+      summary: Get historical metrics
+      description: |
+        Returns historical metric points. Depending on `resolution`, the backend may return
+        raw samples, precomputed rollups, or ad hoc rollups.
+      operationId: getHistory
+      parameters:
+        - name: from
+          in: query
+          description: Start time in ISO-8601 format. Naive timestamps are treated as UTC.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End time in ISO-8601 format. Naive timestamps are treated as UTC.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: resolution
+          in: query
+          description: Bucket size. Use `raw` for unaggregated metric samples.
+          required: false
+          schema:
+            oneOf:
+              - type: string
+                enum: [raw, 1m, 5m, 15m, 1h, 1d]
+              - type: integer
+                minimum: 0
+        - $ref: '#/components/parameters/InstanceId'
+        - name: limit
+          in: query
+          description: Maximum number of points to return. Default 500, maximum 5000.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 500
+      responses:
+        '200':
+          description: Historical point set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /instances:
+    get:
+      summary: List known instances
+      description: Returns distinct monitored instances seen in stored metric samples.
+      operationId: listInstances
+      responses:
+        '200':
+          description: Known instances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InstanceSummary'
+  /snapshots/{raw_snapshot_id}:
+    get:
+      summary: Get raw snapshot
+      description: Returns one stored raw snapshot by raw snapshot id.
+      operationId: getSnapshot
+      parameters:
+        - name: raw_snapshot_id
+          in: path
+          required: true
+          description: Raw snapshot identifier.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Raw snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RawSnapshot'
+        '404':
+          description: Snapshot not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /collect:
+    post:
+      summary: Force an immediate collection
+      description: |
+        Triggers an immediate collection, stores a raw snapshot and metric sample,
+        updates precomputed rollups, and returns the new metric sample including `status`.
+      operationId: collectNow
+      responses:
+        '201':
+          description: Newly collected metric sample
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricSample'
+components:
+  parameters:
+    InstanceId:
+      name: instance_id
+      in: query
+      description: Filter results to a specific monitored instance.
+      required: false
+      schema:
+        type: string
+  schemas:
+    BooleanLike:
+      oneOf:
+        - type: boolean
+        - type: string
+          enum: ['true', 'false', '1', '0', 'yes', 'no', 'online', 'offline']
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      required:
+        - ok
+        - poll_interval_seconds
+        - database_path
+        - tailscale_bin
+        - raw_snapshot_count
+        - metric_sample_count
+        - rollup_resolutions_seconds
+      properties:
+        ok:
+          type: boolean
+        poll_interval_seconds:
+          type: integer
+        database_path:
+          type: string
+        tailscale_bin:
+          type: string
+        tailscale_socket:
+          type:
+            - string
+            - 'null'
+        raw_snapshot_count:
+          type: integer
+        metric_sample_count:
+          type: integer
+        rollup_resolutions_seconds:
+          type: array
+          items:
+            type: integer
+    RawSnapshot:
+      type: object
+      required:
+        - id
+        - timestamp
+        - status
+      properties:
+        id:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        instance_id:
+          type:
+            - string
+            - 'null'
+        device_name:
+          type:
+            - string
+            - 'null'
+        collection_error:
+          type:
+            - string
+            - 'null'
+        status:
+          type: object
+          additionalProperties: true
+    MetricSample:
+      type: object
+      required:
+        - id
+        - raw_snapshot_id
+        - timestamp
+        - peer_count
+        - online_peer_count
+        - total_rx_bytes
+        - total_tx_bytes
+      properties:
+        id:
+          type: integer
+        raw_snapshot_id:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        instance_id:
+          type:
+            - string
+            - 'null'
+        device_name:
+          type:
+            - string
+            - 'null'
+        backend_state:
+          type:
+            - string
+            - 'null'
+        self_online:
+          type:
+            - boolean
+            - 'null'
+        peer_count:
+          type: integer
+        online_peer_count:
+          type: integer
+        total_rx_bytes:
+          type: integer
+        total_tx_bytes:
+          type: integer
+        collection_error:
+          type:
+            - string
+            - 'null'
+        status:
+          type: object
+          additionalProperties: true
+          description: Present when `include_status=true` or when returned from `POST /collect`.
+    RollupPoint:
+      type: object
+      required:
+        - id
+        - timestamp
+        - peer_count
+        - online_peer_count
+        - total_rx_bytes
+        - total_tx_bytes
+        - sample_count
+        - error_count
+      properties:
+        id:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        instance_id:
+          type:
+            - string
+            - 'null'
+        device_name:
+          type:
+            - string
+            - 'null'
+        backend_state:
+          type:
+            - string
+            - 'null'
+        self_online:
+          type:
+            - boolean
+            - 'null'
+        peer_count:
+          type: number
+        online_peer_count:
+          type: number
+        total_rx_bytes:
+          type: integer
+        total_tx_bytes:
+          type: integer
+        sample_count:
+          type: integer
+        error_count:
+          type: integer
+    HistoryQuery:
+      type: object
+      required:
+        - resolution_seconds
+        - limit
+        - source
+      properties:
+        from:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        to:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        resolution_seconds:
+          type: integer
+        instance_id:
+          type:
+            - string
+            - 'null'
+        limit:
+          type: integer
+        source:
+          type: string
+          enum: [raw_samples, precomputed_rollup, ad_hoc_rollup]
+    HistoryPoint:
+      oneOf:
+        - $ref: '#/components/schemas/MetricSample'
+        - $ref: '#/components/schemas/RollupPoint'
+    HistoryResponse:
+      type: object
+      required: [points, query]
+      properties:
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryPoint'
+        query:
+          $ref: '#/components/schemas/HistoryQuery'
+    InstanceSummary:
+      type: object
+      required: [instance_id, last_seen]
+      properties:
+        instance_id:
+          type: string
+        device_name:
+          type:
+            - string
+            - 'null'
+        last_seen:
+          type: string
+          format: date-time

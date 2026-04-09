@@ -21,6 +21,7 @@ APP_PORT = int(os.environ.get("APP_PORT", "5189"))
 
 DEFAULT_HISTORY_LIMIT = 500
 MAX_HISTORY_LIMIT = 5000
+ROLLED_UP_RESOLUTIONS = (60, 300, 3600, 86400)
 ALLOWED_RESOLUTIONS = {
     "raw": 0,
     "1m": 60,
@@ -34,8 +35,16 @@ app = Flask(__name__)
 collection_lock = threading.Lock()
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def to_iso8601(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return to_iso8601(utc_now())
 
 
 def parse_iso8601(value: str | None) -> datetime | None:
@@ -69,6 +78,13 @@ def coerce_bool(value: Any) -> bool | None:
     return None
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    parsed = coerce_bool(value)
+    if parsed is None:
+        return default
+    return parsed
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -76,19 +92,61 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def bucket_start_for(collected_at: str, resolution_seconds: int) -> str:
+    moment = parse_iso8601(collected_at)
+    if moment is None:
+        return collected_at
+    bucket_epoch = int(moment.timestamp()) // resolution_seconds * resolution_seconds
+    return to_iso8601(datetime.fromtimestamp(bucket_epoch, tz=timezone.utc))
+
+
 def get_db_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA foreign_keys=ON")
     return connection
+
+
+def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
 
 
 def init_db() -> None:
     with get_db_connection() as connection:
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS snapshots (
+            CREATE TABLE IF NOT EXISTS raw_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collected_at TEXT NOT NULL,
+                instance_id TEXT,
+                device_name TEXT,
+                status_json TEXT NOT NULL,
+                collection_error TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_snapshots_collected_at
+            ON raw_snapshots (collected_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_snapshots_instance_collected
+            ON raw_snapshots (instance_id, collected_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metric_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_snapshot_id INTEGER NOT NULL UNIQUE,
                 collected_at TEXT NOT NULL,
                 instance_id TEXT,
                 device_name TEXT,
@@ -98,23 +156,119 @@ def init_db() -> None:
                 online_peer_count INTEGER NOT NULL DEFAULT 0,
                 total_rx_bytes INTEGER NOT NULL DEFAULT 0,
                 total_tx_bytes INTEGER NOT NULL DEFAULT 0,
-                status_json TEXT NOT NULL,
-                collection_error TEXT
+                collection_error TEXT,
+                FOREIGN KEY(raw_snapshot_id) REFERENCES raw_snapshots(id) ON DELETE CASCADE
             )
             """
         )
         connection.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_snapshots_collected_at
-            ON snapshots (collected_at DESC)
+            CREATE INDEX IF NOT EXISTS idx_metric_samples_collected_at
+            ON metric_samples (collected_at DESC)
             """
         )
         connection.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_snapshots_instance_collected
-            ON snapshots (instance_id, collected_at DESC)
+            CREATE INDEX IF NOT EXISTS idx_metric_samples_instance_collected
+            ON metric_samples (instance_id, collected_at DESC)
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metric_rollups (
+                resolution_seconds INTEGER NOT NULL,
+                bucket_start TEXT NOT NULL,
+                instance_key TEXT NOT NULL,
+                instance_id TEXT,
+                first_sample_id INTEGER NOT NULL,
+                last_sample_id INTEGER NOT NULL,
+                device_name TEXT,
+                backend_state TEXT,
+                self_online INTEGER,
+                avg_peer_count REAL NOT NULL DEFAULT 0,
+                avg_online_peer_count REAL NOT NULL DEFAULT 0,
+                max_total_rx_bytes INTEGER NOT NULL DEFAULT 0,
+                max_total_tx_bytes INTEGER NOT NULL DEFAULT 0,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (resolution_seconds, bucket_start, instance_key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_metric_rollups_resolution_instance_bucket
+            ON metric_rollups (resolution_seconds, instance_id, bucket_start DESC)
+            """
+        )
+        maybe_migrate_legacy_snapshots(connection)
+
+
+def maybe_migrate_legacy_snapshots(connection: sqlite3.Connection) -> None:
+    if not table_exists(connection, "snapshots"):
+        return
+
+    raw_count = connection.execute("SELECT COUNT(*) AS count FROM raw_snapshots").fetchone()["count"]
+    if raw_count:
+        return
+
+    legacy_count = connection.execute("SELECT COUNT(*) AS count FROM snapshots").fetchone()["count"]
+    if not legacy_count:
+        return
+
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO raw_snapshots (
+            id,
+            collected_at,
+            instance_id,
+            device_name,
+            status_json,
+            collection_error
+        )
+        SELECT
+            id,
+            collected_at,
+            instance_id,
+            device_name,
+            status_json,
+            collection_error
+        FROM snapshots
+        ORDER BY collected_at ASC, id ASC
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO metric_samples (
+            raw_snapshot_id,
+            collected_at,
+            instance_id,
+            device_name,
+            backend_state,
+            self_online,
+            peer_count,
+            online_peer_count,
+            total_rx_bytes,
+            total_tx_bytes,
+            collection_error
+        )
+        SELECT
+            id,
+            collected_at,
+            instance_id,
+            device_name,
+            backend_state,
+            self_online,
+            peer_count,
+            online_peer_count,
+            total_rx_bytes,
+            total_tx_bytes,
+            collection_error
+        FROM snapshots
+        ORDER BY collected_at ASC, id ASC
+        """
+    )
+    rebuild_rollups(connection)
 
 
 def extract_metrics(status_payload: dict[str, Any]) -> dict[str, Any]:
@@ -180,12 +334,95 @@ def collect_live_status() -> tuple[dict[str, Any] | None, str | None]:
         return None, f"tailscale returned invalid JSON: {exc}"
 
 
+def upsert_rollup(connection: sqlite3.Connection, metric_sample_id: int) -> None:
+    sample = connection.execute(
+        """
+        SELECT id, collected_at, instance_id, device_name, backend_state, self_online,
+               peer_count, online_peer_count, total_rx_bytes, total_tx_bytes, collection_error
+        FROM metric_samples
+        WHERE id = ?
+        """,
+        (metric_sample_id,),
+    ).fetchone()
+    if sample is None:
+        return
+
+    instance_key = sample["instance_id"] or ""
+    error_increment = 1 if sample["collection_error"] else 0
+
+    for resolution_seconds in ROLLED_UP_RESOLUTIONS:
+        bucket_start = bucket_start_for(sample["collected_at"], resolution_seconds)
+        connection.execute(
+            """
+            INSERT INTO metric_rollups (
+                resolution_seconds,
+                bucket_start,
+                instance_key,
+                instance_id,
+                first_sample_id,
+                last_sample_id,
+                device_name,
+                backend_state,
+                self_online,
+                avg_peer_count,
+                avg_online_peer_count,
+                max_total_rx_bytes,
+                max_total_tx_bytes,
+                sample_count,
+                error_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT (resolution_seconds, bucket_start, instance_key)
+            DO UPDATE SET
+                last_sample_id = excluded.last_sample_id,
+                device_name = COALESCE(excluded.device_name, metric_rollups.device_name),
+                backend_state = COALESCE(excluded.backend_state, metric_rollups.backend_state),
+                self_online = COALESCE(excluded.self_online, metric_rollups.self_online),
+                avg_peer_count = (
+                    (metric_rollups.avg_peer_count * metric_rollups.sample_count) + excluded.avg_peer_count
+                ) / (metric_rollups.sample_count + 1),
+                avg_online_peer_count = (
+                    (metric_rollups.avg_online_peer_count * metric_rollups.sample_count) + excluded.avg_online_peer_count
+                ) / (metric_rollups.sample_count + 1),
+                max_total_rx_bytes = MAX(metric_rollups.max_total_rx_bytes, excluded.max_total_rx_bytes),
+                max_total_tx_bytes = MAX(metric_rollups.max_total_tx_bytes, excluded.max_total_tx_bytes),
+                sample_count = metric_rollups.sample_count + 1,
+                error_count = metric_rollups.error_count + excluded.error_count
+            """,
+            (
+                resolution_seconds,
+                bucket_start,
+                instance_key,
+                sample["instance_id"],
+                sample["id"],
+                sample["id"],
+                sample["device_name"],
+                sample["backend_state"],
+                sample["self_online"],
+                float(sample["peer_count"] or 0),
+                float(sample["online_peer_count"] or 0),
+                int(sample["total_rx_bytes"] or 0),
+                int(sample["total_tx_bytes"] or 0),
+                error_increment,
+            ),
+        )
+
+
+def rebuild_rollups(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM metric_rollups")
+    sample_rows = connection.execute(
+        "SELECT id FROM metric_samples ORDER BY collected_at ASC, id ASC"
+    ).fetchall()
+    for row in sample_rows:
+        upsert_rollup(connection, int(row["id"]))
+
+
 def insert_snapshot(
     *,
     collected_at: str,
     status_payload: dict[str, Any] | None,
     collection_error: str | None,
-) -> int:
+) -> tuple[int, int]:
     metrics = extract_metrics(status_payload) if status_payload else {
         "instance_id": None,
         "device_name": None,
@@ -199,9 +436,30 @@ def insert_snapshot(
     status_json = json.dumps(status_payload or {}, separators=(",", ":"))
 
     with get_db_connection() as connection:
-        cursor = connection.execute(
+        raw_cursor = connection.execute(
             """
-            INSERT INTO snapshots (
+            INSERT INTO raw_snapshots (
+                collected_at,
+                instance_id,
+                device_name,
+                status_json,
+                collection_error
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                collected_at,
+                metrics["instance_id"],
+                metrics["device_name"],
+                status_json,
+                collection_error,
+            ),
+        )
+        raw_snapshot_id = int(raw_cursor.lastrowid)
+        metric_cursor = connection.execute(
+            """
+            INSERT INTO metric_samples (
+                raw_snapshot_id,
                 collected_at,
                 instance_id,
                 device_name,
@@ -211,12 +469,12 @@ def insert_snapshot(
                 online_peer_count,
                 total_rx_bytes,
                 total_tx_bytes,
-                status_json,
                 collection_error
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                raw_snapshot_id,
                 collected_at,
                 metrics["instance_id"],
                 metrics["device_name"],
@@ -226,35 +484,46 @@ def insert_snapshot(
                 metrics["online_peer_count"],
                 metrics["total_rx_bytes"],
                 metrics["total_tx_bytes"],
-                status_json,
                 collection_error,
             ),
         )
-        return int(cursor.lastrowid)
+        metric_sample_id = int(metric_cursor.lastrowid)
+        upsert_rollup(connection, metric_sample_id)
+
+    return raw_snapshot_id, metric_sample_id
 
 
-def get_snapshot_by_id(snapshot_id: int) -> dict[str, Any] | None:
+def fetch_raw_snapshot(raw_snapshot_id: int) -> dict[str, Any] | None:
     with get_db_connection() as connection:
         row = connection.execute(
             """
-            SELECT id, collected_at, instance_id, device_name, backend_state,
-                   self_online, peer_count, online_peer_count, total_rx_bytes,
-                   total_tx_bytes, status_json, collection_error
-            FROM snapshots
+            SELECT id, collected_at, instance_id, device_name, status_json, collection_error
+            FROM raw_snapshots
             WHERE id = ?
             """,
-            (snapshot_id,),
+            (raw_snapshot_id,),
         ).fetchone()
-    return serialize_snapshot(row) if row else None
-
-
-def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
 
     payload = json.loads(row["status_json"]) if row["status_json"] else {}
     return {
         "id": row["id"],
+        "timestamp": row["collected_at"],
+        "instance_id": row["instance_id"],
+        "device_name": row["device_name"],
+        "collection_error": row["collection_error"],
+        "status": payload,
+    }
+
+
+def serialize_metric_row(row: sqlite3.Row | None, *, include_status: bool = False) -> dict[str, Any] | None:
+    if row is None:
+        return None
+
+    serialized = {
+        "id": row["id"],
+        "raw_snapshot_id": row["raw_snapshot_id"],
         "timestamp": row["collected_at"],
         "instance_id": row["instance_id"],
         "device_name": row["device_name"],
@@ -265,16 +534,21 @@ def serialize_snapshot(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "total_rx_bytes": row["total_rx_bytes"],
         "total_tx_bytes": row["total_tx_bytes"],
         "collection_error": row["collection_error"],
-        "status": payload,
     }
 
+    if include_status:
+        raw_snapshot = fetch_raw_snapshot(int(row["raw_snapshot_id"]))
+        serialized["status"] = {} if raw_snapshot is None else raw_snapshot["status"]
 
-def latest_snapshot(instance_id: str | None = None) -> dict[str, Any] | None:
+    return serialized
+
+
+def latest_metric_sample(instance_id: str | None = None, *, include_status: bool = False) -> dict[str, Any] | None:
     query = """
-        SELECT id, collected_at, instance_id, device_name, backend_state,
+        SELECT id, raw_snapshot_id, collected_at, instance_id, device_name, backend_state,
                self_online, peer_count, online_peer_count, total_rx_bytes,
-               total_tx_bytes, status_json, collection_error
-        FROM snapshots
+               total_tx_bytes, collection_error
+        FROM metric_samples
     """
     params: list[Any] = []
 
@@ -282,24 +556,34 @@ def latest_snapshot(instance_id: str | None = None) -> dict[str, Any] | None:
         query += " WHERE instance_id = ?"
         params.append(instance_id)
 
-    query += " ORDER BY collected_at DESC LIMIT 1"
+    query += " ORDER BY collected_at DESC, id DESC LIMIT 1"
 
     with get_db_connection() as connection:
         row = connection.execute(query, params).fetchone()
-    return serialize_snapshot(row) if row else None
+    return serialize_metric_row(row, include_status=include_status) if row else None
 
 
-def collect_and_store_snapshot() -> dict[str, Any]:
+def collect_and_store_snapshot(*, include_status: bool = True) -> dict[str, Any]:
     with collection_lock:
         collected_at = utc_now_iso()
         status_payload, collection_error = collect_live_status()
-        snapshot_id = insert_snapshot(
+        _, metric_sample_id = insert_snapshot(
             collected_at=collected_at,
             status_payload=status_payload,
             collection_error=collection_error,
         )
-        snapshot = get_snapshot_by_id(snapshot_id)
-        return snapshot or {
+        with get_db_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, raw_snapshot_id, collected_at, instance_id, device_name, backend_state,
+                       self_online, peer_count, online_peer_count, total_rx_bytes,
+                       total_tx_bytes, collection_error
+                FROM metric_samples
+                WHERE id = ?
+                """,
+                (metric_sample_id,),
+            ).fetchone()
+        return serialize_metric_row(row, include_status=include_status) or {
             "timestamp": collected_at,
             "collection_error": collection_error,
             "status": status_payload or {},
@@ -322,12 +606,10 @@ class SnapshotCollector:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        # Take an initial snapshot quickly, then continue on the configured interval.
         while not self._stop_event.is_set():
             try:
-                collect_and_store_snapshot()
+                collect_and_store_snapshot(include_status=False)
             except Exception:
-                # Keep the collector alive even if a single collection fails unexpectedly.
                 insert_snapshot(
                     collected_at=utc_now_iso(),
                     status_payload=None,
@@ -367,7 +649,7 @@ def history_query(
     resolution_seconds: int,
     instance_id: str | None,
     limit: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     where_clauses: list[str] = []
     params: list[Any] = []
 
@@ -387,17 +669,63 @@ def history_query(
         if resolution_seconds <= 0:
             rows = connection.execute(
                 f"""
-                SELECT id, collected_at, instance_id, device_name, backend_state,
+                SELECT id, raw_snapshot_id, collected_at, instance_id, device_name, backend_state,
                        self_online, peer_count, online_peer_count, total_rx_bytes,
-                       total_tx_bytes, status_json, collection_error
-                FROM snapshots
+                       total_tx_bytes, collection_error
+                FROM metric_samples
                 {where_sql}
-                ORDER BY collected_at DESC
+                ORDER BY collected_at DESC, id DESC
                 LIMIT ?
                 """,
                 [*params, limit],
             ).fetchall()
-            return [serialize_snapshot(row) for row in reversed(rows) if row is not None]
+            points = [serialize_metric_row(row, include_status=False) for row in reversed(rows) if row is not None]
+            return points, "raw_samples"
+
+        if resolution_seconds in ROLLED_UP_RESOLUTIONS:
+            rollup_clauses: list[str] = ["resolution_seconds = ?"]
+            rollup_params: list[Any] = [resolution_seconds]
+            if from_dt:
+                rollup_clauses.append("bucket_start >= ?")
+                rollup_params.append(from_dt.isoformat())
+            if to_dt:
+                rollup_clauses.append("bucket_start <= ?")
+                rollup_params.append(to_dt.isoformat())
+            if instance_id:
+                rollup_clauses.append("instance_id = ?")
+                rollup_params.append(instance_id)
+
+            rollup_where = f"WHERE {' AND '.join(rollup_clauses)}"
+            rows = connection.execute(
+                f"""
+                SELECT resolution_seconds, bucket_start, instance_id, device_name, backend_state,
+                       self_online, avg_peer_count, avg_online_peer_count, max_total_rx_bytes,
+                       max_total_tx_bytes, sample_count, error_count, last_sample_id
+                FROM metric_rollups
+                {rollup_where}
+                ORDER BY bucket_start DESC, last_sample_id DESC
+                LIMIT ?
+                """,
+                [*rollup_params, limit],
+            ).fetchall()
+            points = [
+                {
+                    "id": row["last_sample_id"],
+                    "timestamp": row["bucket_start"],
+                    "instance_id": row["instance_id"],
+                    "device_name": row["device_name"],
+                    "backend_state": row["backend_state"],
+                    "self_online": None if row["self_online"] is None else bool(row["self_online"]),
+                    "peer_count": round(row["avg_peer_count"] or 0, 2),
+                    "online_peer_count": round(row["avg_online_peer_count"] or 0, 2),
+                    "total_rx_bytes": row["max_total_rx_bytes"] or 0,
+                    "total_tx_bytes": row["max_total_tx_bytes"] or 0,
+                    "sample_count": row["sample_count"],
+                    "error_count": row["error_count"],
+                }
+                for row in reversed(rows)
+            ]
+            return points, "precomputed_rollup"
 
         rows = connection.execute(
             f"""
@@ -414,18 +742,18 @@ def history_query(
                 MAX(total_tx_bytes) AS total_tx_bytes,
                 COUNT(*) AS sample_count,
                 SUM(CASE WHEN collection_error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
-            FROM snapshots
+            FROM metric_samples
             {where_sql}
             GROUP BY ((CAST(strftime('%s', collected_at) AS INTEGER) / ?) * ?), instance_id
-            ORDER BY bucket_start DESC
+            ORDER BY bucket_start DESC, id DESC
             LIMIT ?
             """,
             [*params, resolution_seconds, resolution_seconds, limit],
         ).fetchall()
 
-    response = []
+    points = []
     for row in reversed(rows):
-        response.append(
+        points.append(
             {
                 "id": row["id"],
                 "timestamp": row["bucket_start"],
@@ -441,11 +769,15 @@ def history_query(
                 "error_count": row["error_count"],
             }
         )
-    return response
+    return points, "ad_hoc_rollup"
 
 
 @app.route("/health")
 def health() -> Any:
+    with get_db_connection() as connection:
+        raw_count = connection.execute("SELECT COUNT(*) AS count FROM raw_snapshots").fetchone()["count"]
+        sample_count = connection.execute("SELECT COUNT(*) AS count FROM metric_samples").fetchone()["count"]
+
     return jsonify(
         {
             "ok": True,
@@ -453,6 +785,9 @@ def health() -> Any:
             "database_path": DB_PATH,
             "tailscale_bin": TAILSCALE_BIN,
             "tailscale_socket": TAILSCALE_SOCKET,
+            "raw_snapshot_count": raw_count,
+            "metric_sample_count": sample_count,
+            "rollup_resolutions_seconds": list(ROLLED_UP_RESOLUTIONS),
         }
     )
 
@@ -460,9 +795,16 @@ def health() -> Any:
 @app.route("/status")
 def status() -> Any:
     instance_id = request.args.get("instance_id")
-    snapshot = latest_snapshot(instance_id=instance_id)
-    if snapshot is None:
-        snapshot = collect_and_store_snapshot()
+    include_status = parse_bool(request.args.get("include_status"), default=False)
+    fresh = parse_bool(request.args.get("fresh"), default=False)
+
+    if fresh:
+        snapshot = collect_and_store_snapshot(include_status=include_status)
+    else:
+        snapshot = latest_metric_sample(instance_id=instance_id, include_status=include_status)
+        if snapshot is None:
+            snapshot = collect_and_store_snapshot(include_status=include_status)
+
     return jsonify(snapshot)
 
 
@@ -485,7 +827,7 @@ def history() -> Any:
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    points = history_query(
+    points, source = history_query(
         from_dt=from_dt,
         to_dt=to_dt,
         resolution_seconds=resolution_seconds,
@@ -502,6 +844,7 @@ def history() -> Any:
                 "resolution_seconds": resolution_seconds,
                 "instance_id": instance_id,
                 "limit": limit,
+                "source": source,
             },
         }
     )
@@ -513,7 +856,7 @@ def instances() -> Any:
         rows = connection.execute(
             """
             SELECT instance_id, device_name, MAX(collected_at) AS last_seen
-            FROM snapshots
+            FROM metric_samples
             WHERE instance_id IS NOT NULL
             GROUP BY instance_id, device_name
             ORDER BY device_name ASC, instance_id ASC
@@ -532,9 +875,17 @@ def instances() -> Any:
     )
 
 
+@app.route("/snapshots/<int:raw_snapshot_id>")
+def snapshot_detail(raw_snapshot_id: int) -> Any:
+    snapshot = fetch_raw_snapshot(raw_snapshot_id)
+    if snapshot is None:
+        return jsonify({"error": "snapshot not found"}), 404
+    return jsonify(snapshot)
+
+
 @app.route("/collect", methods=["POST"])
 def collect_now() -> Any:
-    snapshot = collect_and_store_snapshot()
+    snapshot = collect_and_store_snapshot(include_status=True)
     return jsonify(snapshot), 201
 
 

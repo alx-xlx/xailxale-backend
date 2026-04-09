@@ -4,3 +4,5 @@ tailscale_monitor.db
 .venv/
 data/
 tailscale-state/
+
+.env
